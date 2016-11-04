@@ -149,6 +149,11 @@ class ContextLauncher {
 
   private static ChildProcess startDriver(final RSCConf conf, Promise<?> promise)
       throws IOException {
+
+    // DT 2016.11.02 support using spark.jars as --jars argument to launcher
+    //String sparkJars = conf.get(SPARK_JARS_KEY);
+    //LOG.info("spark.jars currently set to: " + sparkJars);
+
     String livyJars = conf.get(LIVY_JARS);
     if (livyJars == null) {
       String livyHome = System.getenv("LIVY_HOME");
@@ -229,6 +234,12 @@ class ContextLauncher {
       if (conf.get(PROXY_USER) != null) {
         launcher.addSparkArg("--proxy-user", conf.get(PROXY_USER));
       }
+
+      // DT 2016.11.02 support using spark.jars as --jars argument to launcher
+      //if (sparkJars != null) {
+        //launcher.addSparkArg("--jars", sparkJars);
+        //LOG.info("spark.jars set, added --jars argument to spark launcher: " + sparkJars);
+      //}
 
       return new ChildProcess(conf, promise, launcher.launch(), confFile);
     }

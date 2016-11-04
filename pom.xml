@@ -180,7 +180,7 @@
     <module>client-http</module>
     <module>core/scala-2.10</module>
     <module>core/scala-2.11</module>
-    <module>coverage</module>
+    <!--module>coverage</module-->
     <module>examples</module>
     <module>python-api</module>
     <module>repl/scala-2.10</module>
