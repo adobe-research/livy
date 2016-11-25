@@ -24,21 +24,18 @@ import java.nio.ByteBuffer
 import java.nio.file.{Files, Paths}
 import java.util.concurrent.atomic.AtomicLong
 
-import scala.annotation.tailrec
 import scala.collection.JavaConverters._
 import scala.collection.mutable
-import scala.concurrent.{Future, _}
-import scala.util.{Failure, Random, Success, Try}
+import scala.concurrent.Future
+import scala.util.Random
 
 import com.fasterxml.jackson.annotation.JsonIgnoreProperties
 import org.apache.spark.launcher.SparkLauncher
-import org.json4s._
-import org.json4s.JsonAST.JString
-import org.json4s.jackson.JsonMethods._
 
 import com.cloudera.livy._
 import com.cloudera.livy.client.common.HttpMessages._
 import com.cloudera.livy.rsc.{PingJob, RSCClient, RSCConf}
+import com.cloudera.livy.rsc.driver.Statement
 import com.cloudera.livy.server.recovery.SessionStore
 import com.cloudera.livy.sessions._
 import com.cloudera.livy.sessions.Session._
@@ -340,7 +337,7 @@ class InteractiveSession(
 
   import InteractiveSession._
 
-  private var _state: SessionState = initialState
+  private var serverSideState: SessionState = initialState
 
   private val operations = mutable.Map[Long, String]()
   private val operationCounter = new AtomicLong(0)
@@ -369,6 +366,16 @@ class InteractiveSession(
     info(msg)
     sessionLog = IndexedSeq(msg)
   } else {
+    val uriFuture = Future { client.get.getServerUri.get() }
+
+    uriFuture onSuccess { case url =>
+      rscDriverUri = Option(url)
+      sessionSaveLock.synchronized {
+        sessionStore.save(RECOVERY_SESSION_TYPE, recoveryMetadata)
+      }
+    }
+    uriFuture onFailure { case e => warn("Fail to get rsc uri", e) }
+
     // Send a dummy job that will return once the client is ready to be used, and set the
     // state to "idle" at that point.
     client.get.submit(new PingJob()).addListener(new JobHandle.Listener[Void]() {
@@ -380,18 +387,14 @@ class InteractiveSession(
       override def onJobFailed(job: JobHandle[Void], cause: Throwable): Unit = errorOut()
 
       override def onJobSucceeded(job: JobHandle[Void], result: Void): Unit = {
-        rscDriverUri = Option(client.get.getServerUri.get())
-        sessionSaveLock.synchronized {
-          sessionStore.save(RECOVERY_SESSION_TYPE, recoveryMetadata)
-        }
-        transition(SessionState.Idle())
+        transition(SessionState.Running())
       }
 
       private def errorOut(): Unit = {
         // Other code might call stop() to close the RPC channel. When RPC channel is closing,
         // this callback might be triggered. Check and don't call stop() to avoid nested called
         // if the session is already shutting down.
-        if (_state != SessionState.ShuttingDown()) {
+        if (serverSideState != SessionState.ShuttingDown()) {
           transition(SessionState.Error())
           stop()
         }
@@ -399,19 +402,27 @@ class InteractiveSession(
     })
   }
 
-  private[this] var _executedStatements = 0
-  private[this] var _statements = IndexedSeq[Statement]()
-
   override def logLines(): IndexedSeq[String] = app.map(_.log()).getOrElse(sessionLog)
 
   override def recoveryMetadata: RecoveryMetadata =
     InteractiveRecoveryMetadata(id, appId, appTag, kind, owner, proxyUser, rscDriverUri)
 
-  override def state: SessionState = _state
+  override def state: SessionState = {
+    if (serverSideState.isInstanceOf[SessionState.Running]) {
+      // If session is in running state, return the repl state from RSCClient.
+      client
+        .flatMap(s => Option(s.getReplState))
+        .map(SessionState(_))
+        .getOrElse(SessionState.Busy()) // If repl state is unknown, assume repl is busy.
+    } else {
+      serverSideState
+    }
+  }
 
   override def stopSession(): Unit = {
     try {
       transition(SessionState.ShuttingDown())
+      sessionStore.remove(RECOVERY_SESSION_TYPE, id)
       client.foreach { _.stop(true) }
     } catch {
       case _: Exception =>
@@ -424,7 +435,21 @@ class InteractiveSession(
     }
   }
 
-  def statements: IndexedSeq[Statement] = _statements
+  def statements: IndexedSeq[Statement] = {
+    ensureActive()
+    val r = client.get.getReplJobResults().get()
+    r.statements.toIndexedSeq
+  }
+
+  def getStatement(stmtId: Int): Option[Statement] = {
+    ensureActive()
+    val r = client.get.getReplJobResults(stmtId, 1).get()
+    if (r.statements.length < 1) {
+      None
+    } else {
+      Option(r.statements(0))
+    }
+  }
 
   def interrupt(): Future[Unit] = {
     stop()
@@ -432,20 +457,10 @@ class InteractiveSession(
 
   def executeStatement(content: ExecuteRequest): Statement = {
     ensureRunning()
-    _state = SessionState.Busy()
     recordActivity()
 
-    val future = Future {
-      val id = client.get.submitReplCode(content.code)
-      waitForStatement(id)
-    }
-
-    val statement = new Statement(_executedStatements, content, future)
-
-    _executedStatements += 1
-    _statements = _statements :+ statement
-
-    statement
+    val id = client.get.submitReplCode(content.code).get
+    client.get.getReplJobResults(id, 1).get().statements(0)
   }
 
   def runJob(job: Array[Byte]): Long = {
@@ -465,19 +480,19 @@ class InteractiveSession(
   }
 
   def addFile(uri: URI): Unit = {
-    ensureRunning()
+    ensureActive()
     recordActivity()
     client.get.addFile(resolveURI(uri, livyConf)).get()
   }
 
   def addJar(uri: URI): Unit = {
-    ensureRunning()
+    ensureActive()
     recordActivity()
     client.get.addJar(resolveURI(uri, livyConf)).get()
   }
 
   def jobStatus(id: Long): Any = {
-    ensureRunning()
+    ensureActive()
     val clientJobId = operations(id)
     recordActivity()
     // TODO: don't block indefinitely?
@@ -486,64 +501,39 @@ class InteractiveSession(
   }
 
   def cancelJob(id: Long): Unit = {
-    ensureRunning()
+    ensureActive()
     recordActivity()
     operations.remove(id).foreach { client.get.cancel }
   }
 
-  @tailrec
-  private def waitForStatement(id: String): JValue = {
-    ensureRunning()
-    Try(client.get.getReplJobResult(id).get()) match {
-      case Success(null) =>
-        Thread.sleep(1000)
-        waitForStatement(id)
-
-      case Success(response) =>
-        val result = parse(response)
-        // If the response errored out, it's possible it took down the interpreter. Check if
-        // it's still running.
-        result \ "status" match {
-          case JString("error") =>
-            val state = client.get.getReplState().get() match {
-              case "error" => SessionState.Error()
-              case _ => SessionState.Idle()
-            }
-            transition(state)
-          case _ => transition(SessionState.Idle())
-        }
-        result
-
-
-      case Failure(err) =>
-        // If any other error occurs, it probably means the session died. Transition to
-        // the error state.
-        transition(SessionState.Error())
-        throw err
-    }
-  }
-
-  private def transition(state: SessionState) = synchronized {
+  private def transition(newState: SessionState) = synchronized {
     // When a statement returns an error, the session should transit to error state.
     // If the session crashed because of the error, the session should instead go to dead state.
     // Since these 2 transitions are triggered by different threads, there's a race condition.
     // Make sure we won't transit from dead to error state.
-    if (!_state.isInstanceOf[SessionState.Dead] || !state.isInstanceOf[SessionState.Error]) {
-      debug(s"$this session state change from ${_state} to $state")
-      _state = state
+    val areSameStates = serverSideState.getClass() == newState.getClass()
+    val transitFromInactiveToActive = !serverSideState.isActive && newState.isActive
+    if (!areSameStates && !transitFromInactiveToActive) {
+      debug(s"$this session state change from ${serverSideState} to $newState")
+      serverSideState = newState
     }
   }
 
+  private def ensureActive(): Unit = synchronized {
+    require(serverSideState.isActive, "Session isn't active.")
+    require(client.isDefined, "Session is active but client hasn't been created.")
+  }
+
   private def ensureRunning(): Unit = synchronized {
-    _state match {
-      case SessionState.Idle() | SessionState.Busy() =>
+    serverSideState match {
+      case SessionState.Running() =>
       case _ =>
-        throw new IllegalStateException("Session is in state %s" format _state)
+        throw new IllegalStateException("Session is in state %s" format serverSideState)
     }
   }
 
   private def performOperation(job: Array[Byte], sync: Boolean): Long = {
-    ensureRunning()
+    ensureActive()
     recordActivity()
     val future = client.get.bypass(ByteBuffer.wrap(job), sync)
     val opId = operationCounter.incrementAndGet()

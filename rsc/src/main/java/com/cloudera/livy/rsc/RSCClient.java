@@ -61,6 +61,7 @@ public class RSCClient implements LivyClient {
 
   private ContextInfo contextInfo;
   private volatile boolean isAlive;
+  private volatile String replState;
 
   RSCClient(RSCConf conf, Promise<ContextInfo> ctx) throws IOException {
     this.conf = conf;
@@ -274,18 +275,23 @@ public class RSCClient implements LivyClient {
     return contextInfo;
   }
 
-  public String submitReplCode(String code) throws Exception {
-    String id = UUID.randomUUID().toString();
-    deferredCall(new BaseProtocol.ReplJobRequest(code, id), Void.class);
-    return id;
+  public Future<Integer> submitReplCode(String code) throws Exception {
+    return deferredCall(new BaseProtocol.ReplJobRequest(code), Integer.class);
   }
 
-  public Future<String> getReplJobResult(String id) throws Exception {
-    return deferredCall(new BaseProtocol.GetReplJobResult(id), String.class);
+  public Future<ReplJobResults> getReplJobResults(Integer from, Integer size) throws Exception {
+    return deferredCall(new BaseProtocol.GetReplJobResults(from, size), ReplJobResults.class);
   }
 
-  public Future<String> getReplState() {
-    return deferredCall(new BaseProtocol.GetReplState(), String.class);
+  public Future<ReplJobResults> getReplJobResults() throws Exception {
+    return deferredCall(new BaseProtocol.GetReplJobResults(), ReplJobResults.class);
+  }
+
+  /**
+   * @return Return the repl state. If this's not connected to a repl session, it will return null.
+   */
+  public String getReplState() {
+    return replState;
   }
 
   private class ClientProtocol extends BaseProtocol {
@@ -379,6 +385,11 @@ public class RSCClient implements LivyClient {
       } else {
         LOG.warn("Received event for unknown job {}", msg.id);
       }
+    }
+
+    private void handle(ChannelHandlerContext ctx, ReplState msg) {
+      LOG.trace("Received repl state for {}", msg.state);
+      replState = msg.state;
     }
   }
 }

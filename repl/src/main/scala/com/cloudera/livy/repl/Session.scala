@@ -19,15 +19,18 @@
 package com.cloudera.livy.repl
 
 import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicInteger
 
-import scala.concurrent.{ExecutionContext, Future, TimeoutException}
-import scala.concurrent.duration.Duration
+import scala.collection.concurrent.TrieMap
+import scala.concurrent.{ExecutionContext, Future}
 
 import org.apache.spark.SparkContext
-import org.json4s.{DefaultFormats, JValue}
+import org.json4s.jackson.JsonMethods.{compact, render}
+import org.json4s.DefaultFormats
 import org.json4s.JsonDSL._
 
-import com.cloudera.livy.{Logging, Utils}
+import com.cloudera.livy.Logging
+import com.cloudera.livy.rsc.driver.{Statement, StatementState}
 import com.cloudera.livy.sessions._
 
 object Session {
@@ -41,7 +44,7 @@ object Session {
   val TRACEBACK = "traceback"
 }
 
-class Session(interpreter: Interpreter)
+class Session(interpreter: Interpreter, stateChangedCallback: SessionState => Unit = { _ => } )
   extends Logging
 {
   import Session._
@@ -51,17 +54,21 @@ class Session(interpreter: Interpreter)
   private implicit val formats = DefaultFormats
 
   private var _state: SessionState = SessionState.NotStarted()
-  private var _history = IndexedSeq[Statement]()
+  private val _statements = TrieMap[Int, Statement]()
+
+  private val newStatementId = new AtomicInteger(0)
+
+  stateChangedCallback(_state)
 
   def start(): Future[SparkContext] = {
     val future = Future {
-      _state = SessionState.Starting()
+      changeState(SessionState.Starting())
       val sc = interpreter.start()
-      _state = SessionState.Idle()
+      changeState(SessionState.Idle())
       sc
     }
     future.onFailure { case _ =>
-      _state = SessionState.Error(System.currentTimeMillis())
+      changeState(SessionState.Error())
     }
     future
   }
@@ -70,13 +77,18 @@ class Session(interpreter: Interpreter)
 
   def state: SessionState = _state
 
-  def history: IndexedSeq[Statement] = _history
+  def statements: collection.Map[Int, Statement] = _statements.readOnlySnapshot()
 
-  def execute(code: String): Statement = synchronized {
-    val executionCount = _history.length
-    val statement = Statement(executionCount, executeCode(executionCount, code))
-    _history :+= statement
-    statement
+  def execute(code: String): Int = {
+    val statementId = newStatementId.getAndIncrement()
+    _statements(statementId) = new Statement(statementId, StatementState.Waiting, null)
+    Future {
+      _statements(statementId) = new Statement(statementId, StatementState.Running, null)
+
+      _statements(statementId) =
+        new Statement(statementId, StatementState.Available, executeCode(statementId, code))
+    }
+    statementId
   }
 
   def close(): Unit = {
@@ -84,25 +96,38 @@ class Session(interpreter: Interpreter)
     interpreter.close()
   }
 
-  def clearHistory(): Unit = synchronized {
-    _history = IndexedSeq()
+  def clearStatements(): Unit = synchronized {
+    _statements.clear()
   }
 
-  private def executeCode(executionCount: Int, code: String) = {
-    _state = SessionState.Busy()
+  private def changeState(newState: SessionState): Unit = {
+    synchronized {
+      _state = newState
+    }
+    stateChangedCallback(newState)
+  }
 
-    try {
+  private def executeCode(executionCount: Int, code: String): String = synchronized {
+    changeState(SessionState.Busy())
 
+    def transitToIdle() = {
+      val executingLastStatement = executionCount == newStatementId.intValue() - 1
+      if (_statements.isEmpty || executingLastStatement) {
+        changeState(SessionState.Idle())
+      }
+    }
+
+    val resultInJson = try {
       interpreter.execute(code) match {
         case Interpreter.ExecuteSuccess(data) =>
-          _state = SessionState.Idle()
+          transitToIdle()
 
           (STATUS -> OK) ~
           (EXECUTION_COUNT -> executionCount) ~
           (DATA -> data)
 
         case Interpreter.ExecuteIncomplete() =>
-          _state = SessionState.Idle()
+          transitToIdle()
 
           (STATUS -> ERROR) ~
           (EXECUTION_COUNT -> executionCount) ~
@@ -111,7 +136,7 @@ class Session(interpreter: Interpreter)
           (TRACEBACK -> List())
 
         case Interpreter.ExecuteError(ename, evalue, traceback) =>
-          _state = SessionState.Idle()
+          transitToIdle()
 
           (STATUS -> ERROR) ~
           (EXECUTION_COUNT -> executionCount) ~
@@ -120,7 +145,7 @@ class Session(interpreter: Interpreter)
           (TRACEBACK -> traceback)
 
         case Interpreter.ExecuteAborted(message) =>
-          _state = SessionState.Error(System.nanoTime())
+          changeState(SessionState.Error())
 
           (STATUS -> ERROR) ~
           (EXECUTION_COUNT -> executionCount) ~
@@ -132,7 +157,7 @@ class Session(interpreter: Interpreter)
       case e: Throwable =>
         error("Exception when executing code", e)
 
-        _state = SessionState.Idle()
+        transitToIdle()
 
         (STATUS -> ERROR) ~
         (EXECUTION_COUNT -> executionCount) ~
@@ -140,7 +165,7 @@ class Session(interpreter: Interpreter)
         (EVALUE -> e.getMessage) ~
         (TRACEBACK -> List())
     }
+
+    compact(render(resultInJson))
   }
 }
-
-case class Statement(id: Int, result: JValue)
